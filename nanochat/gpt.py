@@ -14,6 +14,7 @@ Notable features:
 import math
 from functools import partial
 from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -31,6 +32,9 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (MQA)
     n_embd: int = 768
+    latent_bits: int = 8
+    kl_free_bits: float = 0.0
+    kl_weight: float = 1.0
 
 
 def norm(x):
@@ -48,6 +52,68 @@ def apply_rotary_emb(x, cos, sin):
     out = out.to(x.dtype) # ensure input/output dtypes match
     return out
 
+class BinaryMapper(nn.Module):
+    def __init__(self, num_bits: int, eps: float = 1e-6):
+        super().__init__()
+        self.num_bits = num_bits
+        self.num_codes = 1 << num_bits
+        bit_values = torch.tensor([1 << i for i in range(num_bits)], dtype=torch.long)
+        self.register_buffer("bit_values", bit_values, persistent=False)
+        self.eps = eps
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        generator: Optional[torch.Generator] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        probs = torch.sigmoid(logits)
+        rand = torch.rand_like(probs) if generator is None else torch.rand_like(probs, generator=generator)
+        bits_bool = rand < probs
+        bits_long = bits_bool.to(torch.long)
+        codes = torch.sum(bits_long * self.bit_values.view(1, 1, -1), dim=-1)
+        bits_float = bits_bool.to(probs.dtype)
+        log_probs = bits_float * torch.log(probs.clamp_min(self.eps)) + (1.0 - bits_float) * torch.log((1.0 - probs).clamp_min(self.eps))
+        log_prob_sum = log_probs.sum(dim=-1, keepdim=True)
+        prob_sample = torch.exp(log_prob_sum)
+        return codes, prob_sample, probs
+
+class NonCausalSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+    def forward(self, q_input: torch.Tensor, kv_input: torch.Tensor) -> torch.Tensor:
+        B, T, _ = q_input.size()
+        q = self.c_q(q_input).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(kv_input).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(kv_input).view(B, T, self.n_kv_head, self.head_dim)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        enable_gqa = self.n_head != self.n_kv_head
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
+class EncoderBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.attn = NonCausalSelfAttention(config)
+        self.mlp = MLP(config)
+
+    def forward(self, q_input: torch.Tensor, kv_input: torch.Tensor) -> torch.Tensor:
+        x = q_input + self.attn(norm(q_input), norm(kv_input))
+        x = x + self.mlp(norm(x))
+        return x
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -63,13 +129,14 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-    def forward(self, x, cos_sin, kv_cache):
-        B, T, C = x.size()
+    def forward(self, q_input, cos_sin, kv_cache, kv_input=None):
+        kv_input = q_input if kv_input is None else kv_input
+        B, T, C = q_input.size()
 
         # Project the input to get queries, keys, and values
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        q = self.c_q(q_input).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(kv_input).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(kv_input).view(B, T, self.n_kv_head, self.head_dim)
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
@@ -139,11 +206,27 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.latent_bits = config.latent_bits
+        self.latent_codes = 1 << self.latent_bits if self.latent_bits > 0 else 0
+        self.latent_block_idx = config.n_layer // 2
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        if self.latent_bits > 0:
+            self.encoder_block = EncoderBlock(config)
+            self.encoder_linear = nn.Linear(config.n_embd, self.latent_bits, bias=False)
+            self.binary_mapper = BinaryMapper(self.latent_bits)
+            self.post_sampler = nn.Embedding(self.latent_codes, config.n_embd)
+            self.zeta = nn.Parameter(torch.zeros(config.n_embd))
+        else:
+            self.encoder_block = None
+            self.encoder_linear = None
+            self.binary_mapper = None
+            self.post_sampler = None
+            self.zeta = None
+        self.register_buffer("latest_kl", torch.tensor(0.0), persistent=False)
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.
@@ -210,11 +293,23 @@ class GPT(nn.Module):
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
         return num_flops_per_token
 
+    def _compute_kl(self, bit_probs: torch.Tensor) -> torch.Tensor:
+        probs = bit_probs.to(torch.float32).clamp(1e-6, 1.0 - 1e-6)
+        kl_bits = probs * torch.log(probs) + (1.0 - probs) * torch.log(1.0 - probs)
+        kl_tokens = kl_bits.sum(dim=-1) + self.latent_bits * math.log(2.0)
+        kl_tokens = torch.clamp(kl_tokens - self.config.kl_free_bits, min=0.0)
+        return kl_tokens.mean()
+
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
         matrix_params = list(self.transformer.h.parameters())
+        if self.latent_bits > 0:
+            matrix_params += list(self.encoder_block.parameters())
+            matrix_params += list(self.encoder_linear.parameters())
+            matrix_params += list(self.post_sampler.parameters())
+            matrix_params.append(self.zeta)
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
@@ -255,24 +350,63 @@ class GPT(nn.Module):
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
         x = norm(x)
-        for block in self.transformer.h:
-            x = block(x, cos_sin, kv_cache)
+        num_blocks = len(self.transformer.h)
+        latent_kl = None
+        latent_block_idx = min(self.latent_block_idx, num_blocks - 1) if num_blocks > 0 else 0
+        for layer_idx in range(latent_block_idx):
+            x = self.transformer.h[layer_idx](x, cos_sin, kv_cache)
+
+        if self.latent_bits > 0 and num_blocks > 0:
+            block = self.transformer.h[latent_block_idx]
+            use_encoder = False
+            if targets is not None:
+                use_encoder = True
+            elif kv_cache is not None and kv_cache.get_pos() == 0:
+                use_encoder = True
+            if use_encoder:
+                zeta = self.zeta.to(dtype=x.dtype, device=x.device).view(1, 1, -1).expand(B, T, -1)
+                encoder_out = self.encoder_block(zeta, x)
+                encoder_logits = self.encoder_linear(norm(encoder_out)).to(torch.float32)
+                codes, prob_sample, bit_probs = self.binary_mapper(encoder_logits)
+                sample_scale = 1.0 + (prob_sample - prob_sample.detach())
+                kl_loss = self._compute_kl(bit_probs)
+                latent_kl = kl_loss
+            else:
+                codes = torch.randint(0, self.latent_codes, (B, T), device=x.device)
+                sample_scale = None
+                bit_probs = None
+            latent_vectors = self.post_sampler(codes)
+            if sample_scale is not None:
+                latent_vectors = latent_vectors * sample_scale.to(latent_vectors.dtype)
+            latent_vectors = latent_vectors.to(x.dtype)
+            x_norm = norm(x)
+            kv_input = x_norm + latent_vectors
+            x = x + block.attn(x_norm, cos_sin, kv_cache, kv_input=kv_input)
+            x = x + block.mlp(norm(x))
+            start_idx = latent_block_idx + 1
+        else:
+            start_idx = latent_block_idx
+        for layer_idx in range(start_idx, num_blocks):
+            x = self.transformer.h[layer_idx](x, cos_sin, kv_cache)
         x = norm(x)
+
+        # Track latest KL value for logging
+        if latent_kl is not None:
+            self.latest_kl.copy_(latent_kl.detach())
+        else:
+            self.latest_kl.zero_()
 
         # Forward the lm_head (compute logits)
         softcap = 15
+        logits = self.lm_head(x)
+        logits = softcap * torch.tanh(logits / softcap) # logits softcap
         if targets is not None:
-            # training mode: compute and return the loss
-            # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
-            logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
             logits = logits.float() # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if latent_kl is not None and self.config.kl_weight != 0.0:
+                loss = loss + self.config.kl_weight * latent_kl
             return loss
         else:
-            # inference mode: compute and return the logits
-            logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap) # logits softcap
             return logits
 
     @torch.inference_mode()
