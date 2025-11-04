@@ -32,7 +32,7 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (MQA)
     n_embd: int = 768
-    latent_bits: int = 8
+    latent_bits: int = 16
     kl_free_bits: float = 0.0
     kl_weight: float = 1.0
 
@@ -70,7 +70,7 @@ class BinaryMapper(nn.Module):
         rand = torch.rand_like(probs) if generator is None else torch.rand_like(probs, generator=generator)
         bits_bool = rand < probs
         bits_long = bits_bool.to(torch.long)
-        codes = torch.sum(bits_long * self.bit_values.view(1, 1, -1), dim=-1)
+        codes = torch.sum(bits_long * self.bit_values.view(1, 1, -1), dim=-1).long()
         bits_float = bits_bool.to(probs.dtype)
         log_probs = bits_float * torch.log(probs.clamp_min(self.eps)) + (1.0 - bits_float) * torch.log((1.0 - probs).clamp_min(self.eps))
         log_prob_sum = log_probs.sum(dim=-1, keepdim=True)
@@ -218,7 +218,7 @@ class GPT(nn.Module):
             self.encoder_block = EncoderBlock(config)
             self.encoder_linear = nn.Linear(config.n_embd, self.latent_bits, bias=False)
             self.binary_mapper = BinaryMapper(self.latent_bits)
-            self.post_sampler = nn.Embedding(self.latent_codes, config.n_embd)
+            self.post_sampler = nn.Linear(self.latent_codes, config.n_embd, bias=False)
             self.zeta = nn.Parameter(torch.zeros(config.n_embd))
         else:
             self.encoder_block = None
@@ -300,6 +300,12 @@ class GPT(nn.Module):
         kl_tokens = torch.clamp(kl_tokens - self.config.kl_free_bits, min=0.0)
         return kl_tokens.mean()
 
+    def _lookup_post_sampler(self, codes: torch.Tensor) -> torch.Tensor:
+        weight_t = self.post_sampler.weight.transpose(0, 1)  # (latent_codes, n_embd)
+        flat_codes = codes.reshape(-1)
+        latent = F.embedding(flat_codes, weight_t)
+        return latent.view(*codes.shape, -1)
+
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -375,7 +381,8 @@ class GPT(nn.Module):
                 codes = torch.randint(0, self.latent_codes, (B, T), device=x.device)
                 sample_scale = None
                 bit_probs = None
-            latent_vectors = self.post_sampler(codes)
+            codes = codes.clamp_min(0).clamp_max(self.latent_codes - 1)
+            latent_vectors = self._lookup_post_sampler(codes)
             if sample_scale is not None:
                 latent_vectors = latent_vectors * sample_scale.to(latent_vectors.dtype)
             latent_vectors = latent_vectors.to(x.dtype)
