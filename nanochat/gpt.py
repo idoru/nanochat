@@ -52,6 +52,18 @@ def apply_rotary_emb(x, cos, sin):
     out = out.to(x.dtype) # ensure input/output dtypes match
     return out
 
+class LatentReadout(nn.Module):
+    def __init__(self, num_codes: int, out_dim: int):
+        super().__init__()
+        self.num_codes = num_codes
+        self.out_dim = out_dim
+        self.weight = nn.Parameter(torch.empty(num_codes, out_dim))
+
+    def forward(self, codes: torch.Tensor) -> torch.Tensor:
+        latent = F.embedding(codes.reshape(-1), self.weight)
+        return latent.view(*codes.shape, self.out_dim)
+
+
 class BinaryMapper(nn.Module):
     def __init__(self, num_bits: int, eps: float = 1e-6):
         super().__init__()
@@ -218,7 +230,7 @@ class GPT(nn.Module):
             self.encoder_block = EncoderBlock(config)
             self.encoder_linear = nn.Linear(config.n_embd, self.latent_bits, bias=False)
             self.binary_mapper = BinaryMapper(self.latent_bits)
-            self.post_sampler = nn.Linear(self.latent_codes, config.n_embd, bias=False)
+            self.post_sampler = LatentReadout(self.latent_codes, config.n_embd)
             self.zeta = nn.Parameter(torch.zeros(config.n_embd))
         else:
             self.encoder_block = None
@@ -300,12 +312,6 @@ class GPT(nn.Module):
         kl_tokens = torch.clamp(kl_tokens - self.config.kl_free_bits, min=0.0)
         return kl_tokens.mean()
 
-    def _lookup_post_sampler(self, codes: torch.Tensor) -> torch.Tensor:
-        weight_t = self.post_sampler.weight.transpose(0, 1)  # (latent_codes, n_embd)
-        flat_codes = codes.reshape(-1)
-        latent = F.embedding(flat_codes, weight_t)
-        return latent.view(*codes.shape, -1)
-
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -382,7 +388,7 @@ class GPT(nn.Module):
                 sample_scale = None
                 bit_probs = None
             codes = codes.clamp_min(0).clamp_max(self.latent_codes - 1)
-            latent_vectors = self._lookup_post_sampler(codes)
+            latent_vectors = self.post_sampler(codes)
             if sample_scale is not None:
                 latent_vectors = latent_vectors * sample_scale.to(latent_vectors.dtype)
             latent_vectors = latent_vectors.to(x.dtype)
