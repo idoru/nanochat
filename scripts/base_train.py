@@ -48,6 +48,11 @@ embedding_lr = 0.2 # learning rate for the embedding parameters (Adam)
 unembedding_lr = 0.004 # learning rate for the unembedding parameters (Adam)
 weight_decay = 0.0 # weight decay for the embedding/unembedding parameters (Adam)
 matrix_lr = 0.02 # learning rate for the matrix parameters (Muon)
+# NOTE: With gated attention (enabled by default), you can experiment with
+# moderately higher learning rates (~1.5-2x). The paper shows improved stability.
+# Try: matrix_lr = 0.03 (1.5x) or 0.04 (2x)
+# Benefits: Faster convergence, potentially better final performance
+# See docs/gated_attention.md for more details
 grad_clip = 1.0 # gradient clipping value (0.0 = disabled)
 warmup_ratio = 0.0 # ratio of iterations for LR warmup
 warmdown_ratio = 0.2 # ratio of iterations for LR warmdown

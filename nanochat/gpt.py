@@ -31,6 +31,8 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (MQA)
     n_embd: int = 768
+    use_gated_attention: bool = True  # Enable gated attention by default (see paper)
+    gate_activation: str = "sigmoid"  # Activation for gate: 'sigmoid' (best) or 'silu'
 
 
 def norm(x):
@@ -48,6 +50,38 @@ def apply_rotary_emb(x, cos, sin):
     out = out.to(x.dtype) # ensure input/output dtypes match
     return out
 
+
+class GatedAttention(nn.Module):
+    """Elementwise, head-specific sigmoid gating after SDPA (position G1).
+
+    Formula: Y' = Y ⊙ σ(X W_θ)
+
+    This implements the gating mechanism from "Gated Attention for Large Language Models"
+    (NeurIPS 2025). Applying a sigmoid gate after scaled dot-product attention provides:
+    - Non-linearity between value and output projections
+    - Input-dependent sparsity in attention outputs
+    - Elimination of attention sink phenomenon
+    - Improved training stability (tolerates ~1.5-2x higher learning rates)
+
+    See docs/gated_attention.md for implementation notes and comparison to production variants.
+    """
+    def __init__(self, n_head, head_dim, n_embd, activation="sigmoid"):
+        super().__init__()
+        self.gate_proj = nn.Linear(n_embd, n_head * head_dim, bias=False)
+        self.activation = torch.sigmoid if activation == "sigmoid" else F.silu
+
+    def forward(self, sdpa_output, pre_norm_x):
+        """
+        Args:
+            sdpa_output: (B, T, n_head * head_dim) - SDPA output after head reassembly
+            pre_norm_x: (B, T, n_embd) - pre-normalized input to attention layer
+        Returns:
+            (B, T, n_head * head_dim) - gated output
+        """
+        gate_scores = self.activation(self.gate_proj(pre_norm_x))
+        return sdpa_output * gate_scores
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -62,6 +96,11 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # Initialize gated attention if enabled
+        self.use_gated_attention = config.use_gated_attention
+        if self.use_gated_attention:
+            self.gate = GatedAttention(self.n_head, self.head_dim, self.n_embd,
+                                        activation=config.gate_activation)
 
     def forward(self, x, cos_sin, kv_cache):
         B, T, C = x.size()
@@ -104,8 +143,14 @@ class CausalSelfAttention(nn.Module):
             attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
 
-        # Re-assemble the heads side by side and project back to residual stream
+        # Re-assemble the heads side by side
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
+
+        # Apply gating (G1 position: after SDPA, before output projection)
+        if self.use_gated_attention:
+            y = self.gate(y, x)  # x is already norm(x) from Block
+
+        # Project back to residual stream
         y = self.c_proj(y)
         return y
 
@@ -181,6 +226,9 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=1.0)
+        elif isinstance(module, GatedAttention):
+            # Small std for stable initial gating ~0.5 after sigmoid
+            torch.nn.init.normal_(module.gate_proj.weight, mean=0.0, std=0.02)
 
     # TODO: bump base theta more, e.g. 100K is more common more recently
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
@@ -201,6 +249,17 @@ class GPT(nn.Module):
 
     def get_device(self):
         return self.transformer.wte.weight.device
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Handle backward compatibility with checkpoints without gating."""
+        has_gate_params = any('gate' in key for key in state_dict.keys())
+
+        if not has_gate_params and self.config.use_gated_attention:
+            print0("Warning: Loading old checkpoint without gated attention.")
+            print0("Gate parameters will be randomly initialized.")
+            return super().load_state_dict(state_dict, strict=False)
+
+        return super().load_state_dict(state_dict, strict=strict)
 
     def estimate_flops(self):
         """ Return the estimated FLOPs per token for the model. Ref: https://arxiv.org/abs/2204.02311 """
